@@ -1,279 +1,322 @@
-/* ═══════════════════════════════════════════════════════
-   FloodGuard AI — Data Layer
-   Fetches sensor data from Google Sheets (CSV export)
-   ═══════════════════════════════════════════════════════ */
-
+/* AQUANEX Data Layer
+   Supports Google Sheets polling, CSV replay, and future hardware ingestion.
+   Dashboard reading shape is kept compatible:
+   { timestamp, temperature, distance, waterLevel, raw }
+*/
 const DataManager = (() => {
-    // Google Sheets config
     const SHEET_ID = '1rdkA1_Bq_7J7xv3-VVaDsCz9s-RfIamknqZG4J4OcbY';
     const GID = '28516179';
     const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&gid=${GID}`;
     const EXPORT_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${GID}`;
 
-    const REFRESH_INTERVAL = 30000; // 30 seconds
+    const SENSOR_HEIGHT_CM = 200;
+    const REFRESH_INTERVAL = 30000;
     const MAX_HISTORY = 200;
 
     let readings = [];
     let refreshTimer = null;
+    let replayTimer = null;
+    let replayRows = [];
+    let replayIndex = 0;
+    let replayActive = false;
     let isConnected = false;
     let usingFallback = false;
+    let sourceMode = 'sheets';
     let listeners = [];
 
-    // ── CSV Parser ──
-    function parseCSV(csvText) {
-        const lines = csvText.trim().split('\n');
-        if (lines.length < 2) return [];
+    function subscribe(callback) {
+        listeners.push(callback);
+        return () => { listeners = listeners.filter(fn => fn !== callback); };
+    }
 
-        // Parse headers — clean up quotes
-        const headers = lines[0].split(',').map(h =>
-            h.replace(/^"|"$/g, '').trim().toLowerCase()
-        );
-
-        const dataRows = [];
-        for (let i = 1; i < lines.length; i++) {
-            const values = parseCSVLine(lines[i]);
-            if (values.length < 2) continue;
-
-            const row = {};
-            headers.forEach((h, idx) => {
-                row[h] = values[idx] ? values[idx].replace(/^"|"$/g, '').trim() : '';
-            });
-            dataRows.push(row);
-        }
-        return dataRows;
+    function notify(event, data = {}) {
+        listeners.forEach(fn => {
+            try { fn(event, data); }
+            catch (error) { console.error('[AQUANEX] Listener error:', error); }
+        });
     }
 
     function parseCSVLine(line) {
         const values = [];
-        let current = '';
-        let inQuotes = false;
+        let value = '';
+        let quoted = false;
 
         for (let i = 0; i < line.length; i++) {
-            const char = line[i];
-            if (char === '"') {
-                inQuotes = !inQuotes;
-            } else if (char === ',' && !inQuotes) {
-                values.push(current);
-                current = '';
+            const ch = line[i];
+            if (ch === '"') {
+                if (quoted && line[i + 1] === '"') {
+                    value += '"';
+                    i++;
+                } else {
+                    quoted = !quoted;
+                }
+            } else if (ch === ',' && !quoted) {
+                values.push(value.trim());
+                value = '';
             } else {
-                current += char;
+                value += ch;
             }
         }
-        values.push(current);
+        values.push(value.trim());
         return values;
     }
 
-    // ── Normalize row data into a standard format ──
-    function normalizeRow(row) {
-        // Try to find temperature value
-        let temperature = null;
-        const tempKeys = ['temperature', 'temp', 'temperature (°c)', 'temperature(°c)', 'temp (c)', 'temperature_c', 'dht11', 'dht22'];
-        for (const key of tempKeys) {
-            if (row[key] !== undefined && row[key] !== '') {
-                temperature = parseFloat(row[key]);
-                if (!isNaN(temperature)) break;
-            }
-        }
+    function parseCSV(csvText) {
+        const lines = csvText.replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim());
+        if (lines.length < 2) return [];
 
-        // Try to find distance/water level value
-        let distance = null;
-        const distKeys = ['distance', 'dist', 'distance (cm)', 'distance(cm)', 'ultrasonic', 'water_level', 'water level', 'level', 'waterlevel', 'water level (cm)'];
-        for (const key of distKeys) {
-            if (row[key] !== undefined && row[key] !== '') {
-                distance = parseFloat(row[key]);
-                if (!isNaN(distance)) break;
-            }
-        }
-
-        // Try to find timestamp
-        let timestamp = null;
-        const dateKeys = ['date', 'datetime', 'timestamp', 'time', 'created_at'];
-        for (const key of dateKeys) {
-            if (row[key] !== undefined && row[key] !== '') {
-                timestamp = row[key];
-                break;
-            }
-        }
-
-        // If we have separate date and time columns, combine them
-        if (row['date'] && row['time']) {
-            timestamp = `${row['date']} ${row['time']}`;
-        }
-
-        // Fallback for any numeric columns if named ones weren't found
-        if (temperature === null || distance === null) {
-            const numericValues = [];
-            Object.values(row).forEach(v => {
-                const num = parseFloat(v);
-                if (!isNaN(num)) numericValues.push(num);
+        const headers = parseCSVLine(lines[0]).map(h => h.replace(/^"|"$/g, '').trim().toLowerCase());
+        return lines.slice(1).map(line => {
+            const values = parseCSVLine(line);
+            const row = {};
+            headers.forEach((header, index) => {
+                row[header] = (values[index] ?? '').trim();
             });
-            if (temperature === null && numericValues.length > 0) temperature = numericValues[0];
-            if (distance === null && numericValues.length > 1) distance = numericValues[1];
+            return row;
+        }).filter(row => Object.values(row).some(value => value !== ''));
+    }
+
+    function firstNumber(row, keys) {
+        for (const key of keys) {
+            const value = row[key];
+            if (value !== undefined && value !== null && String(value).trim() !== '') {
+                const number = Number(value);
+                if (Number.isFinite(number)) return number;
+            }
+        }
+        return null;
+    }
+
+    function firstText(row, keys) {
+        for (const key of keys) {
+            if (row[key] !== undefined && String(row[key]).trim() !== '') {
+                return String(row[key]).trim();
+            }
+        }
+        return null;
+    }
+
+    // Handles both the synthetic CSV schema and common ESP32/Google Sheets headings.
+    function normalizeRow(row) {
+        const temperature = firstNumber(row, [
+            'temperature_c', 'temperature', 'temp', 'temp_c',
+            'temperature (°c)', 'temperature(°c)', 'temp (c)', 'dht11', 'dht22'
+        ]);
+
+        let waterLevel = firstNumber(row, [
+            'water_level_cm', 'water_level', 'water level',
+            'water level (cm)', 'waterlevel', 'level', 'level_cm'
+        ]);
+
+        let distance = firstNumber(row, [
+            'sensor_distance_cm', 'distance_cm', 'distance',
+            'dist', 'distance (cm)', 'distance(cm)', 'ultrasonic'
+        ]);
+
+        // Older sensor sheets may have only an ultrasonic distance value.
+        if (waterLevel === null && distance !== null) {
+            waterLevel = Math.max(0, SENSOR_HEIGHT_CM - distance);
+        }
+        if (distance === null && waterLevel !== null) {
+            distance = Math.max(0, SENSOR_HEIGHT_CM - waterLevel);
         }
 
-        // Calculate water level from distance
-        // Assuming sensor is mounted at a fixed height above the channel
-        // Higher distance = lower water level
-        const SENSOR_HEIGHT = 200; // cm — height of sensor above channel bottom
-        const waterLevel = distance !== null ? Math.max(0, SENSOR_HEIGHT - distance) : null;
+        const timestamp = firstText(row, [
+            'timestamp', 'datetime', 'date_time', 'created_at', 'time', 'date'
+        ]) || new Date().toISOString();
 
         return {
-            timestamp: timestamp || new Date().toISOString(),
-            temperature: temperature,
-            distance: distance,
-            waterLevel: waterLevel,
+            timestamp,
+            temperature,
+            distance,
+            waterLevel,
             raw: row
         };
     }
 
-    // ── Fetch from Google Sheets ──
-    async function fetchFromSheets() {
-        const urls = [CSV_URL, EXPORT_URL];
-
-        for (const url of urls) {
-            try {
-                const response = await fetch(url, {
-                    mode: 'cors',
-                    cache: 'no-cache'
-                });
-
-                if (!response.ok) continue;
-
-                const csvText = await response.text();
-                if (!csvText || csvText.length < 10) continue;
-
-                const rawRows = parseCSV(csvText);
-                if (rawRows.length === 0) continue;
-
-                const normalized = rawRows
-                    .map(normalizeRow)
-                    .filter(r => r.temperature !== null || r.distance !== null);
-
-                if (normalized.length > 0) {
-                    return { success: true, data: normalized };
-                }
-            } catch (e) {
-                console.warn(`Fetch failed for ${url}:`, e.message);
-            }
-        }
-
-        return { success: false, data: [] };
+    function validReading(reading) {
+        return reading.temperature !== null ||
+               reading.distance !== null ||
+               reading.waterLevel !== null;
     }
 
-    // ── Fallback / Simulated Data ──
-    function generateFallbackData() {
-        const data = [];
-        const now = new Date();
-        const baseTemp = 28;
-        const baseDist = 120;
+    function setReadings(next, source) {
+        readings = next.slice(-MAX_HISTORY);
+        isConnected = source === 'live' || source === 'hardware';
+        usingFallback = source === 'fallback' || source === 'synthetic';
+        notify('data-updated', { source, count: readings.length });
+    }
 
-        for (let i = 99; i >= 0; i--) {
-            const time = new Date(now.getTime() - i * 60000);
-            const hourCycle = Math.sin((i / 24) * Math.PI * 2);
-            const noise = () => (Math.random() - 0.5) * 4;
-
-            // Simulate a gradual water rise event around reading 50-70
-            let disturbance = 0;
-            if (i < 60 && i > 30) {
-                disturbance = (60 - i) * 1.5;
-            } else if (i <= 30) {
-                disturbance = Math.max(0, 30 * 1.5 - (30 - i) * 2);
+    async function fetchFromSheets() {
+        for (const url of [CSV_URL, EXPORT_URL]) {
+            try {
+                const response = await fetch(url, { mode: 'cors', cache: 'no-store' });
+                if (!response.ok) continue;
+                const csv = await response.text();
+                const rows = parseCSV(csv).map(normalizeRow).filter(validReading);
+                if (rows.length) return rows;
+            } catch (error) {
+                console.warn('[AQUANEX] Google Sheets fetch failed:', error.message);
             }
+        }
+        return null;
+    }
 
-            const temperature = parseFloat((baseTemp + hourCycle * 3 + noise()).toFixed(1));
-            const distance = parseFloat((baseDist - disturbance + noise() * 2).toFixed(1));
-            const waterLevel = parseFloat(Math.max(0, 200 - distance).toFixed(1));
-
-            data.push({
-                timestamp: time.toISOString(),
-                temperature: temperature,
-                distance: distance,
-                waterLevel: waterLevel,
+    function generateFallbackData() {
+        const result = [];
+        const now = Date.now();
+        for (let i = 99; i >= 0; i--) {
+            const phase = 99 - i;
+            let waterLevel = 75 + 10 * Math.sin(phase / 9);
+            if (phase >= 35 && phase < 65) waterLevel += (phase - 35) * 1.4;
+            if (phase >= 65) waterLevel += Math.max(0, 42 - (phase - 65) * 1.5);
+            waterLevel = Math.max(5, Math.min(190, waterLevel));
+            const temperature = 29 + 1.5 * Math.sin(phase / 13);
+            result.push({
+                timestamp: new Date(now - i * 60000).toISOString(),
+                temperature: Number(temperature.toFixed(1)),
+                distance: Number((SENSOR_HEIGHT_CM - waterLevel).toFixed(1)),
+                waterLevel: Number(waterLevel.toFixed(1)),
                 raw: {}
             });
         }
-        return data;
-    }
-
-    // ── Public API ──
-    function subscribe(callback) {
-        listeners.push(callback);
-        return () => { listeners = listeners.filter(l => l !== callback); };
-    }
-
-    function notifyListeners(event, data) {
-        listeners.forEach(cb => {
-            try { cb(event, data); } catch (e) { console.error('Listener error:', e); }
-        });
+        return result;
     }
 
     async function refresh() {
-        const result = await fetchFromSheets();
-
-        if (result.success) {
-            readings = result.data.slice(-MAX_HISTORY);
-            isConnected = true;
-            usingFallback = false;
-            notifyListeners('data-updated', { source: 'live' });
+        if (replayActive || sourceMode !== 'sheets') return readings;
+        const rows = await fetchFromSheets();
+        if (rows && rows.length) {
+            setReadings(rows, 'live');
         } else {
-            if (readings.length === 0) {
-                // First load and no connection — use fallback
-                readings = generateFallbackData();
-                usingFallback = true;
-                notifyListeners('data-updated', { source: 'fallback' });
-            } else {
-                // Already have data, just mark disconnected
-                usingFallback = true;
-            }
             isConnected = false;
-            notifyListeners('connection-change', { connected: false });
+            if (!readings.length) setReadings(generateFallbackData(), 'fallback');
+            notify('connection-change', { connected: false });
         }
-
         return readings;
     }
 
     function startAutoRefresh() {
-        if (refreshTimer) clearInterval(refreshTimer);
-        refresh(); // initial fetch
+        stopAutoRefresh();
+        sourceMode = 'sheets';
+        refresh();
         refreshTimer = setInterval(refresh, REFRESH_INTERVAL);
     }
 
     function stopAutoRefresh() {
-        if (refreshTimer) {
-            clearInterval(refreshTimer);
-            refreshTimer = null;
+        if (refreshTimer) clearInterval(refreshTimer);
+        refreshTimer = null;
+    }
+
+    async function loadCSVFile(file) {
+        if (!file) throw new Error('Choose a CSV file first.');
+        if (!/\.csv$/i.test(file.name)) throw new Error('Please choose a .csv file.');
+
+        const text = await file.text();
+        const rows = parseCSV(text).map(normalizeRow).filter(validReading);
+        if (!rows.length) {
+            throw new Error('No usable sensor rows found. Check the CSV column headings.');
+        }
+
+        stopAutoRefresh();
+        stopReplay();
+        sourceMode = 'synthetic';
+        replayRows = rows;
+        replayIndex = 0;
+        readings = [];
+        isConnected = false;
+        usingFallback = true;
+        notify('data-updated', { source: 'synthetic-reset', count: 0 });
+        notify('replay-loaded', { total: replayRows.length, fileName: file.name });
+        return replayRows.length;
+    }
+
+    function replayNext() {
+        if (replayIndex >= replayRows.length) {
+            stopReplay();
+            notify('replay-complete', { total: replayRows.length });
+            return;
+        }
+
+        const row = replayRows[replayIndex++];
+        readings = [...readings, { ...row, raw: { ...row.raw, data_source: 'SYNTHETIC' } }].slice(-MAX_HISTORY);
+        notify('data-updated', {
+            source: 'synthetic',
+            index: replayIndex,
+            total: replayRows.length
+        });
+
+        if (replayIndex >= replayRows.length) {
+            stopReplay();
+            notify('replay-complete', { total: replayRows.length });
         }
     }
 
-    function getReadings() {
-        return [...readings];
+    function startReplay(intervalMs = 2000) {
+        if (!replayRows.length) throw new Error('Upload the synthetic CSV file before starting replay.');
+        stopAutoRefresh();
+        stopReplay();
+        sourceMode = 'synthetic';
+        replayActive = true;
+        replayNext();
+        if (replayIndex < replayRows.length) {
+            replayTimer = setInterval(replayNext, Math.max(250, Number(intervalMs) || 2000));
+        }
+        notify('replay-state', { playing: replayActive, index: replayIndex, total: replayRows.length });
     }
 
-    function getLatest() {
-        return readings.length > 0 ? readings[readings.length - 1] : null;
+    function pauseReplay() {
+        stopReplay();
+        notify('replay-state', { playing: false, paused: true, index: replayIndex, total: replayRows.length });
     }
 
-    function getRecentN(n) {
-        return readings.slice(-n);
+    function stopReplay() {
+        if (replayTimer) clearInterval(replayTimer);
+        replayTimer = null;
+        replayActive = false;
     }
 
+    function resetReplay() {
+        stopReplay();
+        replayIndex = 0;
+        readings = [];
+        notify('data-updated', { source: 'synthetic-reset', count: 0 });
+        notify('replay-state', { playing: false, reset: true, index: 0, total: replayRows.length });
+    }
+
+    // Future hardware bridge: call this with each JSON payload received from an API/WebSocket.
+    function ingestReading(payload) {
+        const reading = normalizeRow(payload || {});
+        if (!validReading(reading)) throw new Error('Hardware payload has no valid sensor values.');
+        stopReplay();
+        stopAutoRefresh();
+        sourceMode = 'hardware';
+        readings = [...readings, reading].slice(-MAX_HISTORY);
+        isConnected = true;
+        usingFallback = false;
+        notify('data-updated', { source: 'hardware', count: readings.length });
+    }
+
+    function getReadings() { return [...readings]; }
+    function getLatest() { return readings.length ? readings[readings.length - 1] : null; }
+    function getRecentN(n) { return readings.slice(-n); }
     function getStatus() {
         return {
             connected: isConnected,
-            usingFallback: usingFallback,
+            usingFallback,
+            sourceMode,
+            replayActive,
+            replayIndex,
+            replayTotal: replayRows.length,
             totalReadings: readings.length,
             lastReading: getLatest()
         };
     }
 
     return {
-        subscribe,
-        refresh,
-        startAutoRefresh,
-        stopAutoRefresh,
-        getReadings,
-        getLatest,
-        getRecentN,
-        getStatus
+        subscribe, refresh, startAutoRefresh, stopAutoRefresh,
+        getReadings, getLatest, getRecentN, getStatus,
+        loadCSVFile, startReplay, pauseReplay, resetReplay,
+        ingestReading
     };
 })();

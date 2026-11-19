@@ -1,112 +1,159 @@
-/* ═══════════════════════════════════════════════════════
-   AQUANEX AI — Main Application Controller
-   Initializes all modules and coordinates the refresh cycle
-   ═══════════════════════════════════════════════════════ */
-
+/* AQUANEX application controller + CSV replay controls.
+   Keeps the existing Dashboard, Chatbot and AlertSystem modules. */
 const App = (() => {
     let isInitialized = false;
 
-    // ── Tab Navigation ──
     function initTabs() {
         const tabNav = document.getElementById('tabNav');
         const panels = document.querySelectorAll('.tab-panel');
         const buttons = document.querySelectorAll('.tab-btn');
 
-        tabNav.addEventListener('click', (e) => {
-            const btn = e.target.closest('.tab-btn');
+        tabNav.addEventListener('click', event => {
+            const btn = event.target.closest('.tab-btn');
             if (!btn) return;
 
-            const tabId = btn.dataset.tab;
-
-            // Deactivate all
-            buttons.forEach(b => b.classList.remove('active'));
-            panels.forEach(p => p.classList.remove('active'));
-
-            // Activate clicked tab
+            buttons.forEach(button => button.classList.remove('active'));
+            panels.forEach(panel => panel.classList.remove('active'));
             btn.classList.add('active');
-            const panel = document.getElementById(`panel${capitalize(tabId)}`);
+
+            const panel = document.getElementById(
+                `panel${btn.dataset.tab.charAt(0).toUpperCase()}${btn.dataset.tab.slice(1)}`
+            );
             if (panel) panel.classList.add('active');
         });
     }
 
-    function capitalize(str) {
-        return str.charAt(0).toUpperCase() + str.slice(1);
+    function addReplayControls() {
+        const dashboardPanel = document.getElementById('panelDashboard');
+        if (!dashboardPanel || document.getElementById('csvReplayPanel')) return;
+
+        const panel = document.createElement('section');
+        panel.id = 'csvReplayPanel';
+        panel.style.cssText = [
+            'display:flex', 'flex-wrap:wrap', 'align-items:center', 'gap:10px',
+            'padding:14px 18px', 'margin:0 0 18px', 'background:#fff',
+            'border:1px solid #dce6f1', 'border-radius:14px',
+            'box-shadow:0 3px 12px rgba(20,50,90,.07)'
+        ].join(';');
+
+        panel.innerHTML = `
+            <div style="flex:1 1 220px;min-width:200px">
+                <strong style="display:block;color:#172b4d;font-size:14px">CSV Simulation</strong>
+                <span id="replayStatus" style="font-size:12px;color:#64748b">
+                    Upload your AquaNex synthetic CSV to replay readings.
+                </span>
+            </div>
+            <input id="replayFile" type="file" accept=".csv,text/csv"
+                style="max-width:230px;font-size:12px">
+            <select id="replaySpeed" aria-label="Replay interval"
+                style="padding:9px 10px;border:1px solid #cbd5e1;border-radius:8px">
+                <option value="2000">Every 2 seconds</option>
+                <option value="1000">Every 1 second</option>
+                <option value="500">Every 0.5 second</option>
+                <option value="5000">Every 5 seconds</option>
+            </select>
+            <button id="replayStart" type="button">Start</button>
+            <button id="replayPause" type="button">Pause</button>
+            <button id="replayReset" type="button">Reset</button>
+        `;
+
+        const buttonStyle = 'padding:9px 15px;border:0;border-radius:8px;background:#087fc1;color:white;font-weight:600;cursor:pointer';
+        ['replayStart', 'replayPause', 'replayReset'].forEach(id => {
+            const button = panel.querySelector('#' + id);
+            button.style.cssText = buttonStyle;
+        });
+        panel.querySelector('#replayPause').style.background = '#64748b';
+        panel.querySelector('#replayReset').style.background = '#e78b19';
+
+        dashboardPanel.insertBefore(panel, dashboardPanel.firstChild);
+
+        const fileInput = panel.querySelector('#replayFile');
+        const status = panel.querySelector('#replayStatus');
+        const speed = panel.querySelector('#replaySpeed');
+
+        fileInput.addEventListener('change', async () => {
+            const file = fileInput.files[0];
+            if (!file) return;
+            try {
+                const total = await DataManager.loadCSVFile(file);
+                status.textContent = `${file.name} loaded — ${total} readings ready. Press Start.`;
+            } catch (error) {
+                status.textContent = error.message;
+                console.error('[AQUANEX] CSV load error:', error);
+            }
+        });
+
+        panel.querySelector('#replayStart').addEventListener('click', () => {
+            try {
+                DataManager.startReplay(Number(speed.value));
+                status.textContent = 'Replaying synthetic readings…';
+            } catch (error) {
+                status.textContent = error.message;
+            }
+        });
+
+        panel.querySelector('#replayPause').addEventListener('click', () => {
+            DataManager.pauseReplay();
+            status.textContent = 'Replay paused. Press Start to continue.';
+        });
+
+        panel.querySelector('#replayReset').addEventListener('click', () => {
+            DataManager.resetReplay();
+            status.textContent = 'Replay reset. Press Start to replay from the beginning.';
+        });
     }
 
-    // ── Data Refresh Handler ──
     function onDataEvent(event, data) {
         if (event === 'data-updated') {
             const readings = DataManager.getReadings();
-
-            // Update dashboard
             Dashboard.update(readings);
-
-            // Evaluate alerts
-            AlertSystem.evaluate(readings);
-
-            console.log(`[AQUANEX] Data updated — ${readings.length} readings (${data.source})`);
+            if (readings.length) AlertSystem.evaluate(readings);
+            console.log(`[AQUANEX] ${data.source}: ${readings.length} readings`);
         }
 
         if (event === 'connection-change') {
             const status = DataManager.getStatus();
             console.log(`[AQUANEX] Connection: ${status.connected ? 'Live' : 'Disconnected'}`);
         }
+
+        if (event === 'replay-complete') {
+            const status = document.getElementById('replayStatus');
+            if (status) status.textContent = `Replay complete — ${data.total} readings processed. Press Reset to run again.`;
+        }
+
+        if (event === 'replay-state') {
+            const status = document.getElementById('replayStatus');
+            if (status && data.playing) {
+                status.textContent = `Replaying ${data.index} of ${data.total} readings…`;
+            }
+        }
     }
 
-    // ── Initialize Everything ──
     async function init() {
         if (isInitialized) return;
         isInitialized = true;
 
-        console.log('%c🌊 AQUANEX AI — Starting...', 'color: #448aff; font-size: 14px; font-weight: bold;');
-
         try {
-            // 1. Init Dashboard (creates charts)
             Dashboard.init();
-            console.log('[AQUANEX] Dashboard initialized');
-
-            // 2. Init Alert System
             AlertSystem.init();
-            console.log('[AQUANEX] Alert system initialized');
-
-            // 3. Init Chatbot
             Chatbot.init();
-            console.log('[AQUANEX] Chatbot initialized');
-
-            // 4. Init Tab Navigation
             initTabs();
-            console.log('[AQUANEX] Navigation initialized');
-
-            // 5. Subscribe to data events
+            addReplayControls();
             DataManager.subscribe(onDataEvent);
-
-            // 6. Start data fetching
             DataManager.startAutoRefresh();
-            console.log('[AQUANEX] Data auto-refresh started (30s interval)');
-
-            console.log('%c🌊 AQUANEX AI — Ready!', 'color: #00e676; font-size: 14px; font-weight: bold;');
-
+            console.log('[AQUANEX] Ready. CSV replay controls enabled.');
         } catch (error) {
             console.error('[AQUANEX] Initialization error:', error);
-
-            // Show error toast
             const toastContainer = document.getElementById('toastContainer');
             if (toastContainer) {
                 const toast = document.createElement('div');
                 toast.className = 'toast danger';
-                toast.innerHTML = `
-                    <span class="toast-icon">❌</span>
-                    <div class="toast-body">
-                        <div class="toast-title">Initialization Error</div>
-                        <div class="toast-message">${error.message}</div>
-                    </div>
-                `;
+                toast.textContent = `Initialization Error: ${error.message}`;
                 toastContainer.appendChild(toast);
             }
         }
     }
 
-    // ── Start when DOM is ready ──
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
